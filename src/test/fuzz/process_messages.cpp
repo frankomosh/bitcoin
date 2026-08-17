@@ -17,10 +17,13 @@
 #include <test/fuzz/util/net.h>
 #include <test/util/net.h>
 #include <test/util/random.h>
+#include <test/util/script.h>
 #include <test/util/setup_common.h>
 #include <test/util/time.h>
 #include <test/util/validation.h>
 #include <uint256.h>
+
+#include <cstring>
 #include <util/check.h>
 #include <util/time.h>
 #include <validation.h>
@@ -36,6 +39,7 @@
 
 namespace {
 TestingSetup* g_setup;
+std::vector<std::pair<COutPoint, CAmount>> g_mature_coinbase;
 
 } // namespace
 
@@ -49,7 +53,7 @@ void initialize_process_messages()
             {}),
     };
     g_setup = testing_setup.get();
-    ResetChainmanAndMempool(*g_setup);
+    g_mature_coinbase = ResetChainmanAndMempool(*g_setup);
 }
 
 FUZZ_TARGET(process_messages, .init = initialize_process_messages)
@@ -113,6 +117,25 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
         net_msg.m_type = random_message_type;
         net_msg.data = ConsumeRandomLengthByteVector(fuzzed_data_provider, MAX_PROTOCOL_MESSAGE_LENGTH);
 
+        // When the fuzzed message type is "tx" and we're out of IBD, replace the
+        // random body with a valid transaction spending a mature coinbase. This
+        // avoids extra FDP reads that would shift the layout of non-tx messages.
+        // Inject on even iterations only, so odd ones keep the random body and
+        // exercise the invalid-tx path (ProcessInvalidTx).
+        static size_t cb_index{0};
+        if (net_msg.m_type == "tx" && !chainman.IsInitialBlockDownload() && !g_mature_coinbase.empty() && (++cb_index % 2 == 0)) {
+            const auto& [prevout, value] = g_mature_coinbase[cb_index % g_mature_coinbase.size()];
+            CMutableTransaction mtx;
+            mtx.vin.resize(1);
+            mtx.vin[0].prevout = prevout;
+            mtx.vin[0].scriptWitness.stack = {WITNESS_STACK_ELEM_OP_TRUE};
+            mtx.vout.emplace_back(value - 1000, P2WSH_OP_TRUE);
+            DataStream ds;
+            ds << TX_WITH_WITNESS(CTransaction(mtx));
+            net_msg.data.resize(ds.size());
+            std::memcpy(net_msg.data.data(), ds.data(), ds.size());
+        }
+
         CNode& random_node = *PickValue(fuzzed_data_provider, peers);
 
         connman.FlushSendBuffer(random_node);
@@ -136,6 +159,6 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
     if (block_index_size != WITH_LOCK(chainman.GetMutex(), return chainman.BlockIndex().size()) || initial_sequence != end_sequence) {
         // Reuse the global chainman and mempool, but reset them when dirty.
         MakeRandDeterministicDANGEROUS(uint256::ZERO);
-        ResetChainmanAndMempool(*g_setup);
+        g_mature_coinbase = ResetChainmanAndMempool(*g_setup);
     }
 }
